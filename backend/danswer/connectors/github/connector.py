@@ -1,14 +1,16 @@
+import base64
 import time
 from collections.abc import Iterator
 from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
-from typing import Any
+from typing import Any, Optional
 from typing import cast
 
 from github import Github
 from github import RateLimitExceededException
 from github import Repository
+from github import GithubException
 from github.Issue import Issue
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
@@ -125,6 +127,8 @@ class GithubConnector(LoadConnector, PollConnector):
         state_filter: str = "all",
         include_prs: bool = True,
         include_issues: bool = False,
+        ingest_all_files: bool = False
+        
     ) -> None:
         self.repo_owner = repo_owner
         self.repo_name = repo_name
@@ -132,7 +136,47 @@ class GithubConnector(LoadConnector, PollConnector):
         self.state_filter = state_filter
         self.include_prs = include_prs
         self.include_issues = include_issues
+        self.ingest_all_files = ingest_all_files
+
         self.github_client: Github | None = None
+
+    def _is_text_file(self, file_path: str) -> bool:
+        return any(file_path.endswith(ext) for ext in self.file_extensions)
+    
+    def _fetch_file_content(self, repo: Repository.Repository, file_path: str) -> Optional[str]:
+        try:
+            file_content = repo.get_contents(file_path)
+            if isinstance(file_content, list):
+                return None
+            return base64.b64decode(file_content.content).decode('utf-8')
+        except (GithubException, UnicodeDecodeError):
+            logger.warning(f"Unable to decode file: {file_path}")
+            return None
+
+    def _create_document(self, repo: Repository.Repository, file_path: str, content: str) -> Document:
+        file_url = f"{repo.html_url}/blob/main/{file_path}"
+        return Document(
+            id=file_url,
+            sections=[Section(link=file_url, text=content)],
+            source=DocumentSource.GITHUB,
+            semantic_identifier=file_path,
+            metadata={
+                "file_path": file_path,
+                "repo": f"{self.repo_owner}/{self.repo_name}",
+                "type": "file",
+            },
+        )
+    
+    def _fetch_all_files(self, repo: Repository.Repository) -> Iterator[Document]:
+        contents = repo.get_contents("")
+        while contents:
+            file_content = contents.pop(0)
+            if file_content.type == "dir":
+                contents.extend(repo.get_contents(file_content.path))
+            elif self._is_text_file(file_content.path):
+                content = self._fetch_file_content(repo, file_content.path)
+                if content:
+                    yield self._create_document(repo, file_content.path, content)
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         self.github_client = (
@@ -165,6 +209,11 @@ class GithubConnector(LoadConnector, PollConnector):
             raise ConnectorMissingCredentialError("GitHub")
 
         repo = self._get_github_repo(self.github_client)
+
+        if self.ingest_all_files:
+            file_docs = list(self._fetch_all_files(repo))
+            for doc_batch in batch_generator(file_docs, batch_size=self.batch_size):
+                yield doc_batch
 
         if self.include_prs:
             pull_requests = repo.get_pulls(
